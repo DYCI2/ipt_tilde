@@ -24,7 +24,10 @@ concurrency:
 jobs:
   build:
     name: build & test (Apple Silicon)
-    runs-on: macos-14            # Apple Silicon — the only supported target
+    # Apple Silicon — the only supported target. Pinned rather than macos-latest
+    # so an image switch never changes the toolchain behind our back; macos-26
+    # ships Xcode 26, the toolchain used for local and release builds.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,6 +59,25 @@ jobs:
           test -d "externals/pipo.ipt.mxo"
           test -x build/app/ipt_example/ipt_example
 
+      # The runner's macOS does not decide which macOS the externals run on:
+      # each binary's minos (LC_BUILD_VERSION) does. It comes from
+      # CMAKE_OSX_DEPLOYMENT_TARGET, floored at 11.0 on arm64 (the first Apple
+      # Silicon macOS). Fail if anything in the bundles needs a newer macOS.
+      - name: check minimum macOS of the bundles
+        run: |
+          set -eu
+          max=11.0
+          bad=0
+          for f in externals/*.mxo/Contents/MacOS/*; do
+            minos=$(vtool -show-build "$f" | awk '/minos/ {print $2; exit}')
+            echo "$f: minos $minos"
+            if [ "$(printf '%s\n' "$minos" "$max" | sort -V | tail -n 1)" != "$max" ]; then
+              echo "::error file=$f::requires macOS $minos, more than $max"
+              bad=1
+            fi
+          done
+          exit $bad
+
       - name: runtime check — classify against libipt's dummy model
         run: |
           set -eux
@@ -63,6 +85,25 @@ jobs:
 
       - name: unit test
         run: ctest --test-dir build --output-on-failure
+
+      # Ship the built bundles so macOS builds can be tried without a local
+      # toolchain. tar first: upload-artifact drops file permissions, the
+      # tarball keeps the .mxo bundles exactly as codesign left them.
+      # Skipped on scheduled runs: each torch-carrying .mxo is ~170 MB.
+      # These builds are ad-hoc signed test builds, not releases.
+      - name: package macOS externals
+        if: github.event_name != 'schedule'
+        run: tar -czf ipt_tilde-macos-arm64.tar.gz externals/*.mxo
+
+      - name: upload macOS package
+        if: github.event_name != 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipt_tilde-macos-arm64
+          path: ipt_tilde-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0    # already gzipped
 
   # ---------------------------------------------------------------------------
   # Same build on Windows: libipt fetches the official MSVC libtorch (same
@@ -114,3 +155,18 @@ jobs:
       # at process teardown on Windows — an upstream issue, not covered by our
       # code. The same tests run on the macOS job, and the Windows runtime path
       # is proven by the CLI classification check above.
+
+      # Ship the built package so Windows builds can be tried without a local
+      # toolchain. The zip mirrors the Max package layout (externals/ + support/).
+      # Skipped on scheduled runs: support/ holds a few hundred MB of torch DLLs.
+      # These builds are unsigned test builds, not releases.
+      - name: upload Windows package
+        if: github.event_name != 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipt_tilde-windows-x64
+          path: |
+            externals/*.mxe64
+            support/
+          if-no-files-found: error
+          retention-days: 14
